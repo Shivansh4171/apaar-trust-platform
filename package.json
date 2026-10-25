@@ -15,7 +15,7 @@
     "typecheck": "npm run typecheck --workspace @apaar/api && npm run typecheck --workspace @apaar/web && tsc --noEmit -p tsconfig.seed.json && tsc --noEmit -p tsconfig.tests.json",
     "lint": "eslint .",
     "test": "npm run test:unit && npm run test:e2e",
-    "test:unit": "node --import tsx tests/api/csv-import.test.ts && node --import tsx tests/api/student-review.test.ts",
+    "test:unit": "node --import tsx tests/api/csv-import.test.ts && node --import tsx tests/api/student-review.test.ts && node --import tsx tests/api/auth.test.ts",
     "test:e2e": "playwright test",
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate dev",

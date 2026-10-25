@@ -14,15 +14,17 @@ Institutions upload CSV/XLSX records or enter them manually; the backend validat
 
 ## Security & Data Integrity
 
-Enforce backend role-based access control and institution-level isolation at API and database boundaries. If authentication is not implemented, label demo institution selectors as unauthenticated and never claim production security. Keep documents private and use only synthetic development data. Never commit secrets or place private signing keys in frontend code. Missing student registration alone is not fraud; student confirmation is not official APAAR verification. Label simulated government integrations clearly. Preserve historical submissions, provenance, and audit events; never silently overwrite them.
+Authentication and backend authorization are required for every protected route. Use the existing PostgreSQL-backed session design, Argon2id password hashes, `HttpOnly`/`SameSite=Strict` cookies, exact `APP_ORIGIN` checks on mutations, and login throttling. Derive institution and student scope from the authenticated database user; never trust student IDs, URL/body/header institution codes, or UI hiding as authorization. Keep institution users isolated from other institutions and students limited to their linked record. Apply Zod validation and bounded inputs to credentials and mutations.
+
+Use only synthetic development data. Demo credentials and seed accounts must be clearly local-only; never seed them in production. Never commit secrets, expose password hashes/session IDs, or place private signing keys in frontend code. Missing student registration or response alone is not fraud; student confirmation is not official APAAR verification. Do not add APAAR, DigiLocker, or government integrations in this milestone. Preserve historical submissions, discrepancy values, provenance, and audit events; never silently overwrite them. Authentication remains a prototype without account provisioning, password reset/MFA, or verified institutional identity, so never describe it as ready for real student data.
 
 ## Development & Testing
 
-Implement incrementally and check each milestone; do not generate the application in one untested pass. Consult official documentation when uncertain. Run configured type checks, lint, tests, and builds for changed areas. Test new behavior and bug fixes with synthetic data. Report actual results, limitations, and incomplete integrations; claim no unrun checks.
+Implement incrementally and check each milestone; do not generate the application in one untested pass. Consult official documentation when uncertain. Run `npm run typecheck`, `npm run lint`, `npm test`, and `npm run build` when configured. Test new behavior and bug fixes with synthetic data. Report actual results, limitations, and incomplete integrations; claim no unrun checks.
 
 ## Local Development
 
-Follow setup and check commands in `README.md` and keep them aligned with root `package.json` scripts. Use Docker Compose for local PostgreSQL and seed only synthetic data.
+Follow setup, demo account, migration, and check commands in `README.md` and keep them aligned with root `package.json` scripts. Use Docker Compose for local PostgreSQL and seed only synthetic data. Apply committed migrations with `npm run db:deploy`; create new migrations with `npm run db:migrate` only after checking the documented legacy migration-order issue. Production requires a managed `SESSION_SECRET`, exact HTTPS `APP_ORIGIN`, and correctly configured trusted TLS proxy hops. The default login rate limiter is in-memory and must use a shared store in multi-instance deployments. Never run `db:seed` in production.
 
 ## Style & Contributions
 

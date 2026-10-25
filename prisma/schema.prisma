@@ -30,6 +30,19 @@ enum DiscrepancyStatus {
 enum ReviewActor {
   STUDENT_DEMO
   INSTITUTION_DEMO
+  AICTE_ADMIN
+  INSTITUTION_ADMIN
+  INSTITUTION_OPERATOR
+  STUDENT
+  REVIEWER
+}
+
+enum UserRole {
+  AICTE_ADMIN
+  INSTITUTION_ADMIN
+  INSTITUTION_OPERATOR
+  STUDENT
+  REVIEWER
 }
 
 enum ReviewEventAction {
@@ -44,6 +57,7 @@ model Institution {
   createdAt DateTime        @default(now())
   updatedAt DateTime        @updatedAt
   students  StudentRecord[]
+  users     User[]
 }
 
 model StudentRecord {
@@ -59,6 +73,7 @@ model StudentRecord {
   institution   Institution  @relation(fields: [institutionId], references: [id], onDelete: Restrict)
   confirmations StudentConfirmation[]
   discrepancies DiscrepancyReport[]
+  studentUser   User?         @relation("StudentAccount")
 
   @@unique([institutionId, reference])
   @@index([institutionId, status])
@@ -70,6 +85,8 @@ model StudentConfirmation {
   synthetic       Boolean       @default(true)
   createdAt       DateTime      @default(now())
   studentRecord   StudentRecord @relation(fields: [studentRecordId], references: [id], onDelete: Restrict)
+  actorUserId     String?
+  actorUser       User?          @relation(fields: [actorUserId], references: [id], onDelete: SetNull)
 
   @@index([studentRecordId, createdAt])
 }
@@ -93,6 +110,32 @@ model DiscrepancyReport {
   @@index([status, createdAt])
 }
 
+model User {
+  id              String       @id @default(cuid())
+  email           String       @unique @db.VarChar(254)
+  passwordHash    String       @db.VarChar(255)
+  role            UserRole
+  institutionId   String?
+  studentRecordId String?      @unique
+  active          Boolean      @default(true)
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+  institution     Institution? @relation(fields: [institutionId], references: [id], onDelete: Restrict)
+  studentRecord   StudentRecord? @relation("StudentAccount", fields: [studentRecordId], references: [id], onDelete: Restrict)
+  confirmations   StudentConfirmation[]
+  reviewEvents    DiscrepancyReportEvent[]
+
+  @@index([institutionId, role])
+}
+
+model AuthSession {
+  sid    String   @id @db.VarChar(255)
+  sess   Json
+  expire DateTime @db.Timestamp(6)
+
+  @@index([expire])
+}
+
 model DiscrepancyReportEvent {
   id                  String            @id @default(cuid())
   discrepancyReportId String
@@ -103,6 +146,8 @@ model DiscrepancyReportEvent {
   note                String?           @db.VarChar(1000)
   createdAt           DateTime          @default(now())
   discrepancyReport   DiscrepancyReport  @relation(fields: [discrepancyReportId], references: [id], onDelete: Cascade)
+  actorUserId         String?
+  actorUser           User?             @relation(fields: [actorUserId], references: [id], onDelete: SetNull)
 
   @@index([discrepancyReportId, createdAt])
 }

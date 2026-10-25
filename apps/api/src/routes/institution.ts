@@ -1,6 +1,7 @@
 import { Router, type NextFunction, type Request, type Response } from "express";
 import multer from "multer";
 import { DiscrepancyStatus, PrismaClient, RecordStatus, ReviewActor, ReviewEventAction } from "../generated/prisma/client.js";
+import { authenticatedUser, requireAuthentication, requireRoles, type AuthenticatedUser } from "../auth.js";
 import { z } from "zod";
 import {
   CsvImportInputError,
@@ -12,20 +13,6 @@ import {
 } from "../services/csv-import.js";
 import { reviewerUpdateSchema } from "../services/student-review.js";
 
-interface InstitutionScope {
-  id: string;
-  code: string;
-  name: string;
-}
-
-declare global {
-  namespace Express {
-    interface Request {
-      institutionScope?: InstitutionScope;
-    }
-  }
-}
-
 const paginationSchema = z.object({
   page: z.coerce.number().int().min(1).default(1),
   pageSize: z.coerce.number().int().min(1).max(100).default(20),
@@ -36,52 +23,25 @@ const discrepancyListSchema = paginationSchema.extend({
 });
 const discrepancyIdSchema = z.string().min(10).max(32);
 
-const prototypeAccess = {
-  authentication: "not_implemented",
-  institutionCodeHeaderIsNotAuthentication: true,
-} as const;
-
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 1_000_000, files: 1, fields: 0 },
 });
 
-function scopeOf(request: Request): InstitutionScope {
-  if (!request.institutionScope) throw new Error("Institution scope middleware was not applied.");
-  return request.institutionScope;
+function institutionFilter(user: AuthenticatedUser): { institutionId?: string } {
+  if (user.role === "AICTE_ADMIN" || user.role === "REVIEWER") return {};
+  if (!user.institutionId) throw new Error("Institution account is missing its institution scope.");
+  return { institutionId: user.institutionId };
 }
 
-function institutionScope(prisma: PrismaClient) {
-  return async (request: Request, response: Response, next: NextFunction) => {
-    const code = request.get("x-institution-code")?.trim();
-    if (!code || code.length > 64) {
-      response.status(401).json({
-        error: "institution_context_required",
-        message: "Provide the demo institution code in X-Institution-Code; this header is not authentication.",
-        prototype: prototypeAccess,
-      });
-      return;
-    }
-
-    try {
-      const institution = await prisma.institution.findUnique({
-        where: { code },
-        select: { id: true, code: true, name: true },
-      });
-      if (!institution) {
-        response.status(404).json({
-          error: "institution_not_found",
-          message: "The selected institution was not found.",
-          prototype: prototypeAccess,
-        });
-        return;
-      }
-      request.institutionScope = institution;
-      next();
-    } catch {
-      response.status(503).json({ error: "database_unavailable", message: "Institution data is temporarily unavailable." });
-    }
-  };
+function auditActor(user: AuthenticatedUser): ReviewActor {
+  switch (user.role) {
+    case "AICTE_ADMIN": return ReviewActor.AICTE_ADMIN;
+    case "INSTITUTION_ADMIN": return ReviewActor.INSTITUTION_ADMIN;
+    case "INSTITUTION_OPERATOR": return ReviewActor.INSTITUTION_OPERATOR;
+    case "REVIEWER": return ReviewActor.REVIEWER;
+    default: throw new Error("This role cannot review discrepancy reports.");
+  }
 }
 
 function createCsvImportRepository(prisma: PrismaClient): CsvImportRepository {
@@ -138,53 +98,54 @@ function uploadFailureReport(reason: string) {
 
 export function createInstitutionRouter(prisma: PrismaClient): Router {
   const router = Router();
-  router.use(institutionScope(prisma));
+  router.use(requireAuthentication(prisma));
 
-  router.get("/records", async (request, response) => {
+  router.get("/records", requireRoles("AICTE_ADMIN", "INSTITUTION_ADMIN", "INSTITUTION_OPERATOR"), async (request, response) => {
     const parsedQuery = paginationSchema.safeParse(request.query);
     if (!parsedQuery.success) {
       response.status(400).json({ error: "invalid_pagination", message: "Page must be positive and pageSize must be between 1 and 100." });
       return;
     }
 
-    const institution = scopeOf(request);
+    const user = authenticatedUser(request);
+    const scope = institutionFilter(user);
     const { page, pageSize } = parsedQuery.data;
     try {
+      const where = { synthetic: true, ...scope };
       const [records, totalRecords] = await prisma.$transaction([
         prisma.studentRecord.findMany({
-          where: { institutionId: institution.id },
+          where,
           orderBy: [{ createdAt: "desc" }, { reference: "asc" }],
           skip: (page - 1) * pageSize,
           take: pageSize,
-          select: { id: true, reference: true, fullName: true, program: true, status: true, synthetic: true, createdAt: true },
+          select: { id: true, reference: true, fullName: true, program: true, status: true, synthetic: true, createdAt: true, institution: { select: { name: true, code: true } } },
         }),
-        prisma.studentRecord.count({ where: { institutionId: institution.id } }),
+        prisma.studentRecord.count({ where }),
       ]);
 
       response.json({
-        institution: { code: institution.code, name: institution.name },
+        institution: { code: user.institutionCode, name: user.institutionName },
         records,
         pagination: { page, pageSize, totalRecords, totalPages: Math.ceil(totalRecords / pageSize) },
-        prototype: prototypeAccess,
       });
     } catch {
       response.status(503).json({ error: "database_unavailable", message: "Student records are temporarily unavailable." });
     }
   });
 
-  router.get("/discrepancies", async (request, response) => {
+  router.get("/discrepancies", requireRoles("AICTE_ADMIN", "REVIEWER", "INSTITUTION_ADMIN", "INSTITUTION_OPERATOR"), async (request, response) => {
     const parsedQuery = discrepancyListSchema.safeParse(request.query);
     if (!parsedQuery.success) {
       response.status(400).json({ error: "invalid_pagination", message: "Invalid discrepancy list filters." });
       return;
     }
 
-    const institution = scopeOf(request);
+    const scope = institutionFilter(authenticatedUser(request));
     const { page, pageSize, status } = parsedQuery.data;
     const where = {
       synthetic: true,
       ...(status ? { status } : {}),
-      studentRecord: { is: { institutionId: institution.id, synthetic: true } },
+      studentRecord: { is: { ...scope, synthetic: true } },
     };
     try {
       const [reports, totalReports] = await prisma.$transaction([
@@ -204,29 +165,29 @@ export function createInstitutionRouter(prisma: PrismaClient): Router {
       response.json({
         reports,
         pagination: { page, pageSize, totalReports, totalPages: Math.ceil(totalReports / pageSize) },
-        prototype: prototypeAccess,
       });
     } catch {
-      response.status(503).json({ error: "discrepancies_unavailable", message: "Discrepancy reports are temporarily unavailable.", prototype: prototypeAccess });
+      response.status(503).json({ error: "discrepancies_unavailable", message: "Discrepancy reports are temporarily unavailable." });
     }
   });
 
-  router.patch("/discrepancies/:reportId", async (request, response) => {
+  router.patch("/discrepancies/:reportId", requireRoles("AICTE_ADMIN", "REVIEWER", "INSTITUTION_ADMIN"), async (request, response) => {
     const parsedId = discrepancyIdSchema.safeParse(request.params.reportId);
     const parsedBody = reviewerUpdateSchema.safeParse(request.body);
     if (!parsedId.success || !parsedBody.success) {
-      response.status(400).json({ error: "invalid_review_update", message: "Choose UNDER_REVIEW or RESOLVED and provide a 5–1000 character review note.", prototype: prototypeAccess });
+      response.status(400).json({ error: "invalid_review_update", message: "Choose UNDER_REVIEW or RESOLVED and provide a 5–1000 character review note." });
       return;
     }
 
-    const institution = scopeOf(request);
+    const user = authenticatedUser(request);
+    const scope = institutionFilter(user);
     try {
       const result = await prisma.$transaction(async (transaction) => {
         const existing = await transaction.discrepancyReport.findFirst({
           where: {
             id: parsedId.data,
             synthetic: true,
-            studentRecord: { is: { institutionId: institution.id, synthetic: true } },
+            studentRecord: { is: { ...scope, synthetic: true } },
           },
           select: { id: true, status: true },
         });
@@ -240,7 +201,8 @@ export function createInstitutionRouter(prisma: PrismaClient): Router {
             resolutionNote: parsedBody.data.resolutionNote,
             history: {
               create: {
-                actor: ReviewActor.INSTITUTION_DEMO,
+                actor: auditActor(user),
+                actorUserId: user.id,
                 action: ReviewEventAction.REVIEW_UPDATED,
                 fromStatus: existing.status,
                 toStatus: parsedBody.data.status,
@@ -257,35 +219,37 @@ export function createInstitutionRouter(prisma: PrismaClient): Router {
       });
 
       if (result.kind === "missing") {
-        response.status(404).json({ error: "discrepancy_not_found", message: "No discrepancy report exists in this institution scope.", prototype: prototypeAccess });
+        response.status(404).json({ error: "discrepancy_not_found", message: "No discrepancy report exists in this institution scope." });
         return;
       }
       if (result.kind === "resolved") {
-        response.status(409).json({ error: "discrepancy_already_resolved", message: "Resolved reports cannot be changed in this prototype.", prototype: prototypeAccess });
+        response.status(409).json({ error: "discrepancy_already_resolved", message: "Resolved reports cannot be changed." });
         return;
       }
-      response.json({ report: result.report, prototype: prototypeAccess });
+      response.json({ report: result.report });
     } catch (error) {
-      console.error("Institution demo discrepancy review failed.", { errorType: error instanceof Error ? error.name : "UnknownError" });
-      response.status(503).json({ error: "review_unavailable", message: "The discrepancy review could not be saved.", prototype: prototypeAccess });
+      console.error("Discrepancy review failed.", { errorType: error instanceof Error ? error.name : "UnknownError" });
+      response.status(503).json({ error: "review_unavailable", message: "The discrepancy review could not be saved." });
     }
   });
 
-  router.post("/records/import", upload.single("file"), async (request, response) => {
+  router.post("/records/import", requireRoles("INSTITUTION_ADMIN", "INSTITUTION_OPERATOR"), upload.single("file"), async (request, response) => {
     const file = request.file;
     if (!file) {
-      response.status(400).json({ error: "csv_file_required", message: "Choose a CSV file to import.", prototype: prototypeAccess });
+      response.status(400).json({ error: "csv_file_required", message: "Choose a CSV file to import." });
       return;
     }
     if (!file.originalname.toLowerCase().endsWith(".csv")) {
       const message = "Only .csv files are accepted.";
-      response.status(415).json({ error: "csv_file_required", message, ...uploadFailureReport(message), prototype: prototypeAccess });
+      response.status(415).json({ error: "csv_file_required", message, ...uploadFailureReport(message) });
       return;
     }
 
     try {
-      const report = await importStudentCsv(file.buffer, scopeOf(request).id, createCsvImportRepository(prisma));
-      response.status(200).json({ report, counts: counts(report), prototype: prototypeAccess });
+      const user = authenticatedUser(request);
+      if (!user.institutionId) throw new Error("Institution account is missing its institution scope.");
+      const report = await importStudentCsv(file.buffer, user.institutionId, createCsvImportRepository(prisma));
+      response.status(200).json({ report, counts: counts(report) });
     } catch (error) {
       if (error instanceof CsvImportInputError) {
         response.status(error.statusCode).json({
@@ -293,7 +257,6 @@ export function createInstitutionRouter(prisma: PrismaClient): Router {
           message: error.message,
           report: error.report,
           counts: counts(error.report),
-          prototype: prototypeAccess,
         });
         return;
       }
@@ -307,7 +270,6 @@ export function createInstitutionRouter(prisma: PrismaClient): Router {
           message: "The import could not be confirmed. Review the listed rows and check the record list before retrying.",
           report: error.report,
           counts: counts(error.report),
-          prototype: prototypeAccess,
         });
         return;
       }
@@ -318,7 +280,6 @@ export function createInstitutionRouter(prisma: PrismaClient): Router {
       response.status(503).json({
         error: "import_unavailable",
         message: "The import could not be completed. Check the record list before retrying.",
-        prototype: prototypeAccess,
       });
     }
   });
@@ -338,6 +299,5 @@ export function csvUploadErrorHandler(error: unknown, _request: Request, respons
     error: "invalid_upload",
     message,
     ...uploadFailureReport(message),
-    prototype: prototypeAccess,
   });
 }

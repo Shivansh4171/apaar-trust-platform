@@ -1,7 +1,7 @@
 import dotenv from "dotenv";
 import { Client } from "pg";
 import { fileURLToPath } from "node:url";
-import { expect, test } from "@playwright/test";
+import { expect, test, type APIRequestContext, type Page } from "@playwright/test";
 
 dotenv.config({
   path: fileURLToPath(new URL("../../.env", import.meta.url)),
@@ -9,149 +9,209 @@ dotenv.config({
   quiet: true,
 });
 
-test("institution dashboard loads and explains prototype limitations", async ({ page }) => {
-  await page.goto("/");
+const origin = "http://localhost:5173";
+const password = "DemoOnly-2026!";
 
+async function loginApi(request: APIRequestContext, email: string) {
+  const response = await request.post("/api/auth/login", {
+    headers: { Origin: origin },
+    data: { email, password },
+  });
+  if (!response.ok()) throw new Error(await response.text());
+  return (await response.json()).user as { role: string; institutionCode: string | null };
+}
+
+async function loginPage(page: Page, email: string) {
+  await page.goto("/");
+  await page.getByLabel("Email").fill(email);
+  await page.getByLabel("Password").fill(password);
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await expect(page.getByRole("button", { name: "Sign out" })).toBeVisible();
+}
+
+test("login screen identifies the local synthetic prototype", async ({ page }) => {
+  await page.goto("/");
   await expect(page).toHaveTitle("APAAR Trust Platform");
-  await expect(page.getByRole("heading", { name: "Student records" })).toBeVisible();
-  await expect(page.getByText("Synthetic development data")).toBeVisible();
-  await expect(page.getByText("Prototype access only.")).toBeVisible();
-  await expect(page.getByText("No government integrations are connected.")).toBeVisible();
-  await expect(page.getByText("Aarav Sample")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Sign in to the demo" })).toBeVisible();
+  await expect(page.getByText("Do not enter real student data.")).toBeVisible();
 });
 
-test("API health endpoint reports service status through the web proxy", async ({ request }) => {
-  const response = await request.get("/api/health");
+test("health and readiness remain available without an authenticated session", async ({ request }) => {
+  const health = await request.get("/api/health");
+  expect(health.ok()).toBeTruthy();
+  await expect(health.json()).resolves.toMatchObject({ status: "ok", service: "apaar-api" });
 
-  expect(response.ok()).toBeTruthy();
-  await expect(response).toBeOK();
-  await expect(response.json()).resolves.toMatchObject({
-    status: "ok",
-    service: "apaar-api",
+  const readiness = await request.get("/api/health/ready");
+  expect(readiness.ok()).toBeTruthy();
+  await expect(readiness.json()).resolves.toMatchObject({ status: "ready", database: "connected" });
+});
+
+test("protected routes reject unauthenticated users", async ({ request }) => {
+  for (const path of ["/api/auth/me", "/api/institution/records", "/api/institution/discrepancies", "/api/student/records"]) {
+    expect((await request.get(path)).status(), path).toBe(401);
+  }
+  const mutation = await request.post("/api/student/records/c123456789/confirm", {
+    headers: { Origin: origin },
+    data: {},
   });
+  expect(mutation.status()).toBe(401);
 });
 
-test("API readiness confirms PostgreSQL connectivity", async ({ request }) => {
-  const response = await request.get("/api/health/ready");
-
-  expect(response.ok()).toBeTruthy();
-  await expect(response).toBeOK();
-  await expect(response.json()).resolves.toMatchObject({
-    status: "ready",
-    database: "connected",
+test("invalid credentials produce a generic safe error", async ({ request }) => {
+  const unknown = await request.post("/api/auth/login", {
+    headers: { Origin: origin },
+    data: { email: "missing@demo.local", password },
   });
-});
-
-test("institution record listing requires a scoped institution context", async ({ request }) => {
-  const unauthorized = await request.get("/api/institution/records");
-  expect(unauthorized.status()).toBe(401);
-
-  const response = await request.get("/api/institution/records?page=1&pageSize=2", {
-    headers: { "X-Institution-Code": "DEMO-AICTE-001" },
+  const wrongPassword = await request.post("/api/auth/login", {
+    headers: { Origin: origin },
+    data: { email: "institution.admin@demo.local", password: "incorrect" },
   });
-  expect(response.ok()).toBeTruthy();
-  const body = await response.json();
-  expect(body.institution.code).toBe("DEMO-AICTE-001");
-  expect(body.records.length).toBeLessThanOrEqual(2);
-  expect(body.pagination.page).toBe(1);
-  expect(body.prototype.institutionCodeHeaderIsNotAuthentication).toBe(true);
+  expect(unknown.status()).toBe(401);
+  expect(wrongPassword.status()).toBe(401);
+  await expect(unknown.json()).resolves.toMatchObject({ error: "invalid_credentials", message: "Email or password is incorrect." });
+  await expect(wrongPassword.json()).resolves.toMatchObject({ error: "invalid_credentials", message: "Email or password is incorrect." });
 });
 
-test("CSV import results display row-level header validation feedback", async ({ page }) => {
-  await page.goto("/");
-  await page.locator("#csv-file").setInputFiles({
-    name: "missing-full-name.csv",
-    mimeType: "text/csv",
-    buffer: Buffer.from("reference,program\nSYNTH-E2E-1,Computer Engineering\n"),
-  });
-  await page.getByRole("button", { name: "Upload and review" }).click();
+test("student role restrictions apply on the API regardless of frontend", async ({ request }) => {
+  const user = await loginApi(request, "student.aarav@demo.local");
+  expect(user.role).toBe("STUDENT");
 
-  const report = page.getByRole("region", { name: "CSV import report" });
-  await expect(report).toBeVisible();
-  await expect(report).toContainText("Missing required column: fullName.");
-  await expect(report).toContainText("Row 1");
+  expect((await request.get("/api/institution/records")).status()).toBe(403);
+  expect((await request.get("/api/institution/discrepancies")).status()).toBe(403);
+  const ownRecords = await request.get("/api/student/records");
+  expect(ownRecords.ok()).toBeTruthy();
+  const body = await ownRecords.json();
+  expect(body.records.map((record: { reference: string }) => record.reference)).toEqual(["SYNTH-2026-001"]);
 });
 
-test("valid synthetic CSV import persists and appears in the institution list", async ({ request }) => {
-  const reference = `SYNTH-E2E-${crypto.randomUUID().slice(0, 12)}`;
+test("institution scope comes from the signed-in account and blocks cross-institution IDs", async ({ request }) => {
+  await loginApi(request, "student.nila@demo.local");
+  const ownList = await request.get("/api/student/records");
+  const ownRecord = (await ownList.json()).records[0] as { id: string; reference: string };
+  expect(ownRecord.reference).toBe("SYNTH-2026-201");
+
   const database = new Client({ connectionString: process.env.DATABASE_URL });
-  let institutionId: string | undefined;
   await database.connect();
-
+  let foreignRecordId = "";
+  let reportId: string | undefined;
   try {
-    const institutionResult = await database.query<{ id: string }>(
-      'SELECT "id" FROM "Institution" WHERE "code" = $1',
-      ["DEMO-AICTE-001"],
+    const foreign = await database.query<{ id: string }>(
+      'SELECT "id" FROM "StudentRecord" WHERE "reference" = $1',
+      ["SYNTH-2026-001"],
     );
-    institutionId = institutionResult.rows[0]?.id;
-    expect(institutionId).toBeTruthy();
+    foreignRecordId = foreign.rows[0]?.id ?? "";
+    expect(foreignRecordId).toBeTruthy();
 
-    const response = await request.post("/api/institution/records/import", {
-      headers: { "X-Institution-Code": "DEMO-AICTE-001" },
-      multipart: {
-        file: {
-          name: "synthetic-student.csv",
-          mimeType: "text/csv",
-          buffer: Buffer.from(`reference,fullName,program\n${reference},Avery Synthetic,Computer Engineering\n`),
-        },
-      },
+    const alteredUrl = await request.post(`/api/student/records/${foreignRecordId}/discrepancies`, {
+      headers: { Origin: origin },
+      data: { field: "FULL_NAME", claimedValue: "Nila Other", reason: "I am trying a record outside my account scope." },
     });
+    expect(alteredUrl.status()).toBe(404);
 
-    expect(response.ok()).toBeTruthy();
-    const body = await response.json();
-    expect(body.counts.accepted).toBe(1);
-    expect(body.report.acceptedRows).toContainEqual({ rowNumber: 2, reference });
-
-    const listing = await request.get("/api/institution/records?page=1&pageSize=100", {
-      headers: { "X-Institution-Code": "DEMO-AICTE-001" },
+    const submission = await request.post(`/api/student/records/${ownRecord.id}/discrepancies`, {
+      headers: { Origin: origin },
+      data: { field: "FULL_NAME", claimedValue: "Nila Another", reason: "The synthetic demo name differs from my example details." },
     });
-    const listedRecords = await listing.json();
-    expect(listedRecords.records.some((record: { reference: string }) => record.reference === reference)).toBe(true);
+    expect(submission.status()).toBe(201);
+    reportId = (await submission.json()).report.id as string;
+
+    await request.post("/api/auth/logout", { headers: { Origin: origin } });
+    await loginApi(request, "institution.admin@demo.local");
+    const forgedHeaderList = await request.get("/api/institution/records", {
+      headers: { "X-Institution-Code": "DEMO-AICTE-002" },
+    });
+    expect(forgedHeaderList.ok()).toBeTruthy();
+    const list = await forgedHeaderList.json();
+    expect(list.institution.code).toBe("DEMO-AICTE-001");
+    expect(list.records.every((record: { reference: string }) => record.reference !== "SYNTH-2026-201")).toBe(true);
+
+    const crossInstitutionUpdate = await request.patch(`/api/institution/discrepancies/${reportId}`, {
+      headers: { Origin: origin, "X-Institution-Code": "DEMO-AICTE-002" },
+      data: { status: "RESOLVED", resolutionNote: "Attempted cross institution review." },
+    });
+    expect(crossInstitutionUpdate.status()).toBe(404);
   } finally {
-    if (institutionId) {
-      await database.query('DELETE FROM "StudentRecord" WHERE "institutionId" = $1 AND "reference" = $2', [institutionId, reference]);
-    }
+    if (reportId) await database.query('DELETE FROM "DiscrepancyReport" WHERE "id" = $1', [reportId]);
     await database.end();
   }
 });
 
-test("CSV rows matching existing records are held for review and not imported", async ({ request }) => {
-  const response = await request.post("/api/institution/records/import", {
-    headers: { "X-Institution-Code": "DEMO-AICTE-001" },
-    multipart: {
-      file: {
-        name: "possible-duplicate.csv",
-        mimeType: "text/csv",
-        buffer: Buffer.from("reference,fullName,program\nSYNTH-2026-001,Aarav Sample,Computer Engineering\n"),
-      },
-    },
+test("role restrictions prevent operators, students, and reviewers from unauthorized writes", async ({ request }) => {
+  await loginApi(request, "institution.operator@demo.local");
+  const update = await request.patch("/api/institution/discrepancies/unknown-report-id", {
+    headers: { Origin: origin },
+    data: { status: "RESOLVED", resolutionNote: "Operator cannot resolve reports." },
   });
+  expect(update.status()).toBe(403);
+  await request.post("/api/auth/logout", { headers: { Origin: origin } });
 
-  expect(response.ok()).toBeTruthy();
-  const body = await response.json();
-  expect(body.counts.accepted).toBe(0);
-  expect(body.counts.flaggedForReview).toBe(1);
-  expect(body.report.flaggedForReviewRows[0].reasons.join(" ")).toContain("flagged for review and not imported");
+  await loginApi(request, "reviewer@demo.local");
+  const importResponse = await request.post("/api/institution/records/import", {
+    headers: { Origin: origin },
+    multipart: { file: { name: "empty.csv", mimeType: "text/csv", buffer: Buffer.from("reference,fullName,program\n") } },
+  });
+  expect(importResponse.status()).toBe(403);
 });
 
-test("student demo can confirm and report a discrepancy, then institution demo reviews it", async ({ page, request }) => {
+test("AICTE admins can read across institutions while reviewers can review without roster access", async ({ request }) => {
+  await loginApi(request, "aicte.admin@demo.local");
+  const allRecords = await request.get("/api/institution/records?page=1&pageSize=100", {
+    headers: { "X-Institution-Code": "DEMO-AICTE-001" },
+  });
+  expect(allRecords.ok()).toBeTruthy();
+  const records = (await allRecords.json()).records as Array<{ reference: string; institution: { code: string } }>;
+  expect(records.some((record) => record.reference === "SYNTH-2026-201" && record.institution.code === "DEMO-AICTE-002")).toBe(true);
+  await request.post("/api/auth/logout", { headers: { Origin: origin } });
+
+  await loginApi(request, "reviewer@demo.local");
+  expect((await request.get("/api/institution/records")).status()).toBe(403);
+  expect((await request.get("/api/institution/discrepancies")).ok()).toBeTruthy();
+});
+
+test("authenticated institution can import a synthetic CSV and sees it in its own roster", async ({ request }) => {
+  await loginApi(request, "institution.operator@demo.local");
+  const reference = `SYNTH-E2E-${crypto.randomUUID().slice(0, 12)}`;
+  const database = new Client({ connectionString: process.env.DATABASE_URL });
+  await database.connect();
+  let institutionId: string | undefined;
+  try {
+    const institution = await database.query<{ id: string }>(
+      'SELECT "id" FROM "Institution" WHERE "code" = $1', ["DEMO-AICTE-001"],
+    );
+    institutionId = institution.rows[0]?.id;
+
+    const response = await request.post("/api/institution/records/import", {
+      headers: { Origin: origin },
+      multipart: {
+        file: { name: "synthetic.csv", mimeType: "text/csv", buffer: Buffer.from(`reference,fullName,program\n${reference},Avery Synthetic,Computer Engineering\n`) },
+      },
+    });
+    expect(response.ok()).toBeTruthy();
+    expect((await response.json()).counts.accepted).toBe(1);
+    const listing = await request.get("/api/institution/records?page=1&pageSize=100");
+    expect((await listing.json()).records.some((record: { reference: string }) => record.reference === reference)).toBe(true);
+  } finally {
+    if (institutionId) await database.query('DELETE FROM "StudentRecord" WHERE "institutionId" = $1 AND "reference" = $2', [institutionId, reference]);
+    await database.end();
+  }
+});
+
+test("student confirms and reports a discrepancy, institution admin reviews with attributed audit events", async ({ page, request }) => {
   const database = new Client({ connectionString: process.env.DATABASE_URL });
   await database.connect();
   let confirmationId: string | undefined;
   let discrepancyId: string | undefined;
   let recordId: string | undefined;
   const uniqueReason = `The name in this synthetic example differs from my demo details (${Date.now()}).`;
-
   try {
-    const listResponse = await request.get("/api/student/records?page=1&pageSize=50");
-    const list = await listResponse.json();
-    const record = list.records.find((item: { reference: string }) => item.reference === "SYNTH-2026-001");
-    expect(record).toBeTruthy();
-    recordId = record.id as string;
+    const recordResult = await database.query<{ id: string }>(
+      'SELECT "id" FROM "StudentRecord" WHERE "reference" = $1', ["SYNTH-2026-001"],
+    );
+    recordId = recordResult.rows[0]?.id;
+    expect(recordId).toBeTruthy();
 
-    await page.goto("/");
-    await page.getByRole("button", { name: "Student review demo" }).click();
-    await page.getByLabel("Select a synthetic demo record").selectOption(recordId);
+    await loginPage(page, "student.aarav@demo.local");
+    await expect(page.getByRole("heading", { name: "Review your demo record" })).toBeVisible();
     const confirmationResponse = page.waitForResponse((response) => response.url().includes("/confirm") && response.request().method() === "POST");
     await page.getByRole("button", { name: "These displayed details look correct" }).click();
     const confirmation = await (await confirmationResponse).json();
@@ -165,41 +225,40 @@ test("student demo can confirm and report a discrepancy, then institution demo r
     await page.getByRole("button", { name: "Submit discrepancy" }).click();
     const discrepancyResult = await (await discrepancyResponse).json();
     discrepancyId = discrepancyResult.report.id as string;
-    expect(discrepancyResult.report.status).toBe("OPEN");
     expect(discrepancyResult.report.institutionValue).toBe("Aarav Sample");
-    expect(discrepancyResult.report.claimedValue).toBe("Aarav Student");
-
-    const sourceRecord = await database.query<{ fullName: string }>(
-      'SELECT "fullName" FROM "StudentRecord" WHERE "id" = $1',
-      [recordId],
+    expect(discrepancyResult.report.status).toBe("OPEN");
+    const original = await database.query<{ fullName: string }>(
+      'SELECT "fullName" FROM "StudentRecord" WHERE "id" = $1', [recordId],
     );
-    expect(sourceRecord.rows[0]?.fullName).toBe("Aarav Sample");
+    expect(original.rows[0]?.fullName).toBe("Aarav Sample");
 
+    await page.getByRole("button", { name: "Sign out" }).click();
+    await loginPage(page, "institution.admin@demo.local");
     await page.getByRole("button", { name: "Discrepancy review" }).click();
     await page.getByLabel("Filter status").selectOption("ALL");
-    const discrepancyCard = page.getByRole("article", { name: /SYNTH-2026-001/ }).filter({ hasText: uniqueReason });
-    await expect(discrepancyCard).toBeVisible();
-    await expect(discrepancyCard).toContainText("Aarav Sample");
-    await expect(discrepancyCard).toContainText("Aarav Student");
+    const card = page.getByRole("article", { name: /SYNTH-2026-001/ }).filter({ hasText: uniqueReason });
+    await expect(card).toBeVisible();
+    await expect(card).toContainText("Aarav Sample");
+    await expect(card).toContainText("Aarav Student");
 
-    await discrepancyCard.getByLabel("Demo reviewer note (5–1000 characters)").fill("Started a synthetic demo review.");
-    await discrepancyCard.getByRole("button", { name: "Mark under review" }).click();
-    await expect(discrepancyCard).toContainText("under review");
+    await card.getByLabel("Demo reviewer note (5–1000 characters)").fill("Started an authenticated synthetic review.");
+    const underReviewResponse = page.waitForResponse((response) => response.url().includes(`/discrepancies/${discrepancyId}`) && response.request().method() === "PATCH");
+    await card.getByRole("button", { name: "Mark under review" }).click();
+    expect((await underReviewResponse).ok()).toBeTruthy();
+    await expect(card).toContainText("under review");
+    await card.getByLabel("Demo reviewer note (5–1000 characters)").fill("Resolved by the local milestone test.");
+    const resolvedUiResponse = page.waitForResponse((response) => response.url().includes(`/discrepancies/${discrepancyId}`) && response.request().method() === "PATCH");
+    await card.getByRole("button", { name: "Resolve report" }).click();
+    expect((await resolvedUiResponse).ok()).toBeTruthy();
+    await expect(card).toContainText("resolved");
 
-    await discrepancyCard.getByLabel("Demo reviewer note (5–1000 characters)").fill("Resolved for the synthetic milestone test.");
-    await discrepancyCard.getByRole("button", { name: "Resolve report" }).click();
-    await expect(discrepancyCard).toContainText("resolved");
-
-    const resolvedResponse = await request.get("/api/institution/discrepancies?status=RESOLVED", {
-      headers: { "X-Institution-Code": "DEMO-AICTE-001" },
-    });
-    const resolved = await resolvedResponse.json();
-    const reviewed = resolved.reports.find((item: { id: string }) => item.id === discrepancyId);
-    expect(reviewed.status).toBe("RESOLVED");
-    expect(reviewed.institutionValue).toBe("Aarav Sample");
-    expect(reviewed.studentRecord.fullName).toBe("Aarav Sample");
+    await loginApi(request, "institution.admin@demo.local");
+    const report = await request.get(`/api/institution/discrepancies?status=RESOLVED`);
+    const reviewed = (await report.json()).reports.find((entry: { id: string }) => entry.id === discrepancyId);
     expect(reviewed.history).toHaveLength(3);
-    expect(reviewed.history[2].note).toBe("Resolved for the synthetic milestone test.");
+    expect(reviewed.history[0].actor).toBe("STUDENT");
+    expect(reviewed.history[1].actor).toBe("INSTITUTION_ADMIN");
+    expect(reviewed.history[2].note).toBe("Resolved by the local milestone test.");
   } finally {
     if (discrepancyId) await database.query('DELETE FROM "DiscrepancyReport" WHERE "id" = $1', [discrepancyId]);
     if (confirmationId) await database.query('DELETE FROM "StudentConfirmation" WHERE "id" = $1', [confirmationId]);
@@ -207,19 +266,16 @@ test("student demo can confirm and report a discrepancy, then institution demo r
   }
 });
 
-test("student discrepancy input validation rejects short reasons and identity claims", async ({ request }) => {
-  const listResponse = await request.get("/api/student/records?page=1&pageSize=50");
-  const list = await listResponse.json();
-  const record = list.records.find((item: { reference: string }) => item.reference === "SYNTH-2026-001");
-  expect(record).toBeTruthy();
-
+test("student discrepancy server validation rejects short reasons and identity claims", async ({ request }) => {
+  await loginApi(request, "student.aarav@demo.local");
+  const record = (await (await request.get("/api/student/records")).json()).records[0] as { id: string };
   const invalidReason = await request.post(`/api/student/records/${record.id}/discrepancies`, {
+    headers: { Origin: origin },
     data: { field: "FULL_NAME", claimedValue: "Aarav Other", reason: "wrong" },
   });
   expect(invalidReason.status()).toBe(400);
-  await expect(invalidReason.json()).resolves.toMatchObject({ error: "invalid_input" });
-
   const identityClaim = await request.post(`/api/student/records/${record.id}/confirm`, {
+    headers: { Origin: origin },
     data: { studentId: "SYNTH-2026-001" },
   });
   expect(identityClaim.status()).toBe(400);

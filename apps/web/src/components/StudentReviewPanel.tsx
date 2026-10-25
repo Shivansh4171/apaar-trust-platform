@@ -18,7 +18,7 @@ type DiscrepancyReport = {
   createdAt: string;
 };
 
-const prototypeNote = "This demo has no student sign-in. Selecting a synthetic record only selects what to review; it does not verify who you are. A missing response is not evidence of fraud.";
+const prototypeNote = "This signed-in account is a local synthetic demo account, not verified real-world identity. A missing response is not evidence of fraud.";
 
 export default function StudentReviewPanel() {
   const [records, setRecords] = useState<DemoRecord[]>([]);

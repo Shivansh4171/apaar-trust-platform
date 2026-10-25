@@ -1,5 +1,4 @@
 import { useEffect, useState } from "react";
-import { demoInstitutionCode } from "../demo-config";
 
 type ReviewStatus = "OPEN" | "UNDER_REVIEW" | "RESOLVED";
 type Discrepancy = {
@@ -15,7 +14,7 @@ type Discrepancy = {
   studentRecord: { reference: string; fullName: string; program: string };
   history: Array<{
     id: string;
-    actor: "STUDENT_DEMO" | "INSTITUTION_DEMO";
+    actor: "STUDENT_DEMO" | "INSTITUTION_DEMO" | "AICTE_ADMIN" | "INSTITUTION_ADMIN" | "INSTITUTION_OPERATOR" | "STUDENT" | "REVIEWER";
     action: "SUBMITTED" | "REVIEW_UPDATED";
     fromStatus: ReviewStatus | null;
     toStatus: ReviewStatus;
@@ -30,7 +29,19 @@ const fieldLabels: Record<Discrepancy["field"], string> = {
   PROGRAM: "Program",
 };
 
-export default function InstitutionDiscrepancyPanel() {
+function actorLabel(actor: Discrepancy["history"][number]["actor"]) {
+  switch (actor) {
+    case "STUDENT":
+    case "STUDENT_DEMO": return "Student account";
+    case "AICTE_ADMIN": return "AICTE administrator";
+    case "INSTITUTION_ADMIN": return "Institution administrator";
+    case "INSTITUTION_OPERATOR": return "Institution operator";
+    case "REVIEWER": return "Reviewer";
+    case "INSTITUTION_DEMO": return "Institution demo account";
+  }
+}
+
+export default function InstitutionDiscrepancyPanel({ canReview }: { canReview: boolean }) {
   const [reports, setReports] = useState<Discrepancy[]>([]);
   const [statusFilter, setStatusFilter] = useState<"ALL" | ReviewStatus>("OPEN");
   const [notes, setNotes] = useState<Record<string, string>>({});
@@ -44,9 +55,7 @@ export default function InstitutionDiscrepancyPanel() {
     setError("");
     try {
       const query = filter === "ALL" ? "" : `?status=${filter}`;
-      const response = await fetch(`/api/institution/discrepancies${query}`, {
-        headers: { "X-Institution-Code": demoInstitutionCode },
-      });
+      const response = await fetch(`/api/institution/discrepancies${query}`);
       const result = await response.json() as { reports?: Discrepancy[]; message?: string };
       if (!response.ok) throw new Error(result.message ?? "Could not load discrepancy reports.");
       setReports(result.reports ?? []);
@@ -70,7 +79,7 @@ export default function InstitutionDiscrepancyPanel() {
     try {
       const response = await fetch(`/api/institution/discrepancies/${reportId}`, {
         method: "PATCH",
-        headers: { "Content-Type": "application/json", "X-Institution-Code": demoInstitutionCode },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ status, resolutionNote }),
       });
       const result = await response.json() as { report?: Discrepancy; message?: string };
@@ -91,7 +100,7 @@ export default function InstitutionDiscrepancyPanel() {
   return (
     <section className="space-y-5">
       <div className="rounded-3xl border border-amber-200 bg-amber-50 p-5 text-sm leading-6 text-amber-950 sm:p-6">
-        <strong>Prototype reviewer view.</strong> The demo institution code scopes reports, but is not authentication. Review actions are recorded as demo actions, not verified staff decisions.
+        <strong>Authenticated prototype reviewer view.</strong> Reports are scoped by the signed-in account role. Demo accounts and records are synthetic, and review actions are not official APAAR decisions.
       </div>
       {error && <p role="alert" className="rounded-xl bg-rose-50 px-4 py-3 text-sm text-rose-800">{error}</p>}
       {message && <p role="status" className="rounded-xl bg-green-50 px-4 py-3 text-sm text-green-900">{message}</p>}
@@ -131,7 +140,7 @@ export default function InstitutionDiscrepancyPanel() {
               </dl>
               <div className="mt-3 rounded-2xl border border-slate-100 px-4 py-3"><p className="text-xs font-semibold text-slate-500">Student’s reason</p><p className="mt-1 whitespace-pre-wrap text-sm leading-6 text-slate-700">{report.reason}</p></div>
 
-              {report.status !== "RESOLVED" && (
+              {canReview && report.status !== "RESOLVED" && (
                 <div className="mt-4 rounded-2xl border border-slate-200 p-4">
                   <label htmlFor={`review-note-${report.id}`} className="block text-xs font-semibold text-slate-700">Demo reviewer note (5–1000 characters)</label>
                   <textarea id={`review-note-${report.id}`} value={notes[report.id] ?? ""} onChange={(event) => setNotes((current) => ({ ...current, [report.id]: event.target.value }))} minLength={5} maxLength={1000} rows={2} className="mt-1.5 w-full rounded-xl border border-slate-300 px-3 py-2.5 text-sm focus:border-indigo-600 focus:outline-none focus:ring-2 focus:ring-indigo-100" />
@@ -148,7 +157,7 @@ export default function InstitutionDiscrepancyPanel() {
                 <ol className="mt-3 space-y-3">
                   {report.history.map((event) => (
                     <li key={event.id} className="border-l-2 border-indigo-100 pl-3 text-xs text-slate-600">
-                      <p className="font-semibold text-slate-800">{event.actor === "STUDENT_DEMO" ? "Student demo submission" : "Institution demo review"} · {event.fromStatus ? `${event.fromStatus.toLowerCase()} → ` : ""}{event.toStatus.toLowerCase()}</p>
+                          <p className="font-semibold text-slate-800">{actorLabel(event.actor)} · {event.fromStatus ? `${event.fromStatus.toLowerCase()} → ` : ""}{event.toStatus.toLowerCase()}</p>
                       <p className="mt-0.5">{new Date(event.createdAt).toLocaleString()}</p>
                       {event.note && <p className="mt-1 leading-5">{event.note}</p>}
                     </li>

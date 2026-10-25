@@ -1,9 +1,9 @@
 import { Router } from "express";
 import { DiscrepancyStatus, PrismaClient, ReviewActor, ReviewEventAction } from "../generated/prisma/client.js";
 import { z } from "zod";
+import { authenticatedUser, requireAuthentication, requireRoles } from "../auth.js";
 import {
   emptyStudentConfirmationSchema,
-  reviewerUpdateSchema,
   studentDiscrepancyInputSchema,
   studentRecordIdSchema,
   validateClaimedValue,
@@ -16,8 +16,7 @@ const listQuerySchema = z.object({
 });
 
 const prototypeStatus = {
-  authentication: "not_implemented",
-  selectedRecordDoesNotVerifyIdentity: true,
+  authentication: "synthetic_demo_account",
   officialApaarVerification: false,
   missingStudentResponseIsNotFraudEvidence: true,
 } as const;
@@ -28,6 +27,7 @@ function invalidInput(response: { status: (code: number) => typeof response; jso
 
 export function createStudentRouter(prisma: PrismaClient): Router {
   const router = Router();
+  router.use(requireAuthentication(prisma), requireRoles("STUDENT"));
 
   router.get("/records", async (request, response) => {
     const parsedQuery = listQuerySchema.safeParse(request.query);
@@ -37,16 +37,21 @@ export function createStudentRouter(prisma: PrismaClient): Router {
     }
 
     const { page, pageSize } = parsedQuery.data;
+    const user = authenticatedUser(request);
+    if (!user.studentRecordId) {
+      response.status(403).json({ error: "student_record_not_linked", message: "This student account has no linked synthetic record." });
+      return;
+    }
     try {
       const [records, totalRecords] = await prisma.$transaction([
         prisma.studentRecord.findMany({
-          where: { synthetic: true },
+          where: { id: user.studentRecordId, synthetic: true },
           orderBy: [{ createdAt: "desc" }, { reference: "asc" }],
           skip: (page - 1) * pageSize,
           take: pageSize,
           select: { id: true, reference: true, fullName: true, program: true, status: true, createdAt: true },
         }),
-        prisma.studentRecord.count({ where: { synthetic: true } }),
+        prisma.studentRecord.count({ where: { id: user.studentRecordId, synthetic: true } }),
       ]);
 
       response.json({
@@ -66,6 +71,11 @@ export function createStudentRouter(prisma: PrismaClient): Router {
       invalidInput(response, "Select a demo record and submit an empty confirmation request.");
       return;
     }
+    const user = authenticatedUser(request);
+    if (parsedId.data !== user.studentRecordId) {
+      response.status(404).json({ error: "demo_record_not_found", message: "The linked synthetic record was not found.", prototype: prototypeStatus });
+      return;
+    }
 
     try {
       const result = await prisma.$transaction(async (transaction) => {
@@ -76,7 +86,7 @@ export function createStudentRouter(prisma: PrismaClient): Router {
         if (!record) return null;
 
         const confirmation = await transaction.studentConfirmation.create({
-          data: { studentRecordId: record.id, synthetic: true },
+          data: { studentRecordId: record.id, actorUserId: user.id, synthetic: true },
           select: { id: true, createdAt: true },
         });
         return { record, confirmation };
@@ -105,6 +115,11 @@ export function createStudentRouter(prisma: PrismaClient): Router {
       invalidInput(response, "Provide a valid affected field, claimed value, and reason (10–1000 characters).");
       return;
     }
+    const user = authenticatedUser(request);
+    if (parsedId.data !== user.studentRecordId) {
+      response.status(404).json({ error: "demo_record_not_found", message: "The linked synthetic record was not found.", prototype: prototypeStatus });
+      return;
+    }
 
     const claimedValueCheck = validateClaimedValue(parsedBody.data.field, parsedBody.data.claimedValue);
     if (!claimedValueCheck.success) {
@@ -115,7 +130,7 @@ export function createStudentRouter(prisma: PrismaClient): Router {
     try {
       const result = await prisma.$transaction(async (transaction) => {
         const record = await transaction.studentRecord.findFirst({
-          where: { id: parsedId.data, synthetic: true },
+          where: { id: user.studentRecordId!, synthetic: true },
           select: { id: true, reference: true, fullName: true, program: true },
         });
         if (!record) return { kind: "missing" as const };
@@ -137,10 +152,11 @@ export function createStudentRouter(prisma: PrismaClient): Router {
             synthetic: true,
             history: {
               create: {
-                actor: ReviewActor.STUDENT_DEMO,
+                actor: ReviewActor.STUDENT,
                 action: ReviewEventAction.SUBMITTED,
                 toStatus: DiscrepancyStatus.OPEN,
-                note: "Demo student submitted a discrepancy report.",
+                note: parsedBody.data.reason,
+                actorUserId: user.id,
               },
             },
           },

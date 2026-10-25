@@ -2,6 +2,8 @@ import express, { type ErrorRequestHandler } from "express";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "./generated/prisma/client.js";
 import { apiEnvironment } from "./config.js";
+import { requireSameOrigin, sessionMiddleware } from "./auth.js";
+import { createAuthRouter } from "./routes/auth.js";
 import { createInstitutionRouter, csvUploadErrorHandler } from "./routes/institution.js";
 import { createStudentRouter } from "./routes/student.js";
 
@@ -11,7 +13,16 @@ const prisma = new PrismaClient({ adapter });
 export function createApp() {
   const app = express();
   app.disable("x-powered-by");
+  app.set("trust proxy", apiEnvironment.TRUST_PROXY_HOPS);
   app.use(express.json({ limit: "100kb" }));
+  app.use(sessionMiddleware);
+  app.use((request, response, next) => {
+    if (["POST", "PUT", "PATCH", "DELETE"].includes(request.method)) {
+      requireSameOrigin(request, response, next);
+      return;
+    }
+    next();
+  });
 
   app.get("/api/health", (_request, response) => {
     response.json({
@@ -31,6 +42,7 @@ export function createApp() {
     }
   });
 
+  app.use("/api/auth", createAuthRouter(prisma));
   app.use("/api/institution", createInstitutionRouter(prisma));
   app.use("/api/student", createStudentRouter(prisma));
   app.use(csvUploadErrorHandler);
