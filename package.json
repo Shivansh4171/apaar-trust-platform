@@ -1,0 +1,52 @@
+{
+  "name": "apaar-trust-platform",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "apps/api",
+    "apps/web"
+  ],
+  "scripts": {
+    "dev": "concurrently -k -n api,web -c blue,green \"npm:dev:api\" \"npm:dev:web\"",
+    "dev:api": "npm --workspace @apaar/api run dev",
+    "dev:web": "npm --workspace @apaar/web run dev",
+    "build": "npm run build --workspace @apaar/api && npm run build --workspace @apaar/web",
+    "typecheck": "npm run typecheck --workspace @apaar/api && npm run typecheck --workspace @apaar/web && tsc --noEmit -p tsconfig.seed.json && tsc --noEmit -p tsconfig.tests.json",
+    "lint": "eslint .",
+    "test": "npm run test:unit && npm run test:e2e",
+    "test:unit": "node --import tsx tests/api/csv-import.test.ts",
+    "test:e2e": "playwright test",
+    "db:generate": "prisma generate",
+    "db:migrate": "prisma migrate dev",
+    "db:deploy": "prisma migrate deploy",
+    "db:seed": "prisma db seed",
+    "db:studio": "prisma studio"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.56.1",
+    "@types/node": "^24.10.0",
+    "@typescript-eslint/parser": "^8.46.0",
+    "@vitejs/plugin-react": "^5.0.4",
+    "concurrently": "^9.2.1",
+    "eslint": "^9.38.0",
+    "eslint-plugin-react-hooks": "^5.2.0",
+    "eslint-plugin-react-refresh": "^0.4.24",
+    "globals": "^16.4.0",
+    "prisma": "^7.10.1",
+    "tailwindcss": "^4.1.15",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.46.0",
+    "vite": "^7.1.12"
+  },
+  "dependencies": {
+    "@tailwindcss/vite": "^4.1.15",
+    "dotenv": "^17.2.3",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  }
+}

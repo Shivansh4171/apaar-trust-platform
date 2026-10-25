@@ -1,0 +1,41 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../apps/api/src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum RecordStatus {
+  VERIFIED
+  UNVERIFIED
+  PENDING
+  DISPUTED
+  REPORTED
+}
+
+model Institution {
+  id        String          @id @default(cuid())
+  name      String
+  code      String          @unique
+  createdAt DateTime        @default(now())
+  updatedAt DateTime        @updatedAt
+  students  StudentRecord[]
+}
+
+model StudentRecord {
+  id            String       @id @default(cuid())
+  institutionId String
+  reference     String
+  fullName      String
+  program       String
+  status        RecordStatus @default(UNVERIFIED)
+  synthetic     Boolean      @default(true)
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+  institution   Institution  @relation(fields: [institutionId], references: [id], onDelete: Restrict)
+
+  @@unique([institutionId, reference])
+  @@index([institutionId, status])
+}
