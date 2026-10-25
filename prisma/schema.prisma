@@ -15,6 +15,28 @@ enum RecordStatus {
   REPORTED
 }
 
+enum DiscrepancyField {
+  REFERENCE
+  FULL_NAME
+  PROGRAM
+}
+
+enum DiscrepancyStatus {
+  OPEN
+  UNDER_REVIEW
+  RESOLVED
+}
+
+enum ReviewActor {
+  STUDENT_DEMO
+  INSTITUTION_DEMO
+}
+
+enum ReviewEventAction {
+  SUBMITTED
+  REVIEW_UPDATED
+}
+
 model Institution {
   id        String          @id @default(cuid())
   name      String
@@ -35,7 +57,52 @@ model StudentRecord {
   createdAt     DateTime     @default(now())
   updatedAt     DateTime     @updatedAt
   institution   Institution  @relation(fields: [institutionId], references: [id], onDelete: Restrict)
+  confirmations StudentConfirmation[]
+  discrepancies DiscrepancyReport[]
 
   @@unique([institutionId, reference])
   @@index([institutionId, status])
+}
+
+model StudentConfirmation {
+  id              String        @id @default(cuid())
+  studentRecordId String
+  synthetic       Boolean       @default(true)
+  createdAt       DateTime      @default(now())
+  studentRecord   StudentRecord @relation(fields: [studentRecordId], references: [id], onDelete: Restrict)
+
+  @@index([studentRecordId, createdAt])
+}
+
+model DiscrepancyReport {
+  id               String                  @id @default(cuid())
+  studentRecordId  String
+  field            DiscrepancyField
+  institutionValue String                  @db.VarChar(120)
+  claimedValue     String                  @db.VarChar(120)
+  reason           String                  @db.VarChar(1000)
+  status           DiscrepancyStatus       @default(OPEN)
+  resolutionNote   String?                 @db.VarChar(1000)
+  synthetic        Boolean                 @default(true)
+  createdAt        DateTime                @default(now())
+  updatedAt        DateTime                @updatedAt
+  studentRecord    StudentRecord           @relation(fields: [studentRecordId], references: [id], onDelete: Restrict)
+  history          DiscrepancyReportEvent[]
+
+  @@index([studentRecordId, status])
+  @@index([status, createdAt])
+}
+
+model DiscrepancyReportEvent {
+  id                  String            @id @default(cuid())
+  discrepancyReportId String
+  actor               ReviewActor
+  action              ReviewEventAction
+  fromStatus          DiscrepancyStatus?
+  toStatus            DiscrepancyStatus
+  note                String?           @db.VarChar(1000)
+  createdAt           DateTime          @default(now())
+  discrepancyReport   DiscrepancyReport  @relation(fields: [discrepancyReportId], references: [id], onDelete: Cascade)
+
+  @@index([discrepancyReportId, createdAt])
 }

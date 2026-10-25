@@ -1,6 +1,6 @@
 import { Router, type NextFunction, type Request, type Response } from "express";
 import multer from "multer";
-import { PrismaClient, RecordStatus } from "../generated/prisma/client.js";
+import { DiscrepancyStatus, PrismaClient, RecordStatus, ReviewActor, ReviewEventAction } from "../generated/prisma/client.js";
 import { z } from "zod";
 import {
   CsvImportInputError,
@@ -10,6 +10,7 @@ import {
   type CsvImportTransaction,
   type StudentCsvRow,
 } from "../services/csv-import.js";
+import { reviewerUpdateSchema } from "../services/student-review.js";
 
 interface InstitutionScope {
   id: string;
@@ -29,6 +30,11 @@ const paginationSchema = z.object({
   page: z.coerce.number().int().min(1).default(1),
   pageSize: z.coerce.number().int().min(1).max(100).default(20),
 });
+
+const discrepancyListSchema = paginationSchema.extend({
+  status: z.nativeEnum(DiscrepancyStatus).optional(),
+});
+const discrepancyIdSchema = z.string().min(10).max(32);
 
 const prototypeAccess = {
   authentication: "not_implemented",
@@ -163,6 +169,105 @@ export function createInstitutionRouter(prisma: PrismaClient): Router {
       });
     } catch {
       response.status(503).json({ error: "database_unavailable", message: "Student records are temporarily unavailable." });
+    }
+  });
+
+  router.get("/discrepancies", async (request, response) => {
+    const parsedQuery = discrepancyListSchema.safeParse(request.query);
+    if (!parsedQuery.success) {
+      response.status(400).json({ error: "invalid_pagination", message: "Invalid discrepancy list filters." });
+      return;
+    }
+
+    const institution = scopeOf(request);
+    const { page, pageSize, status } = parsedQuery.data;
+    const where = {
+      synthetic: true,
+      ...(status ? { status } : {}),
+      studentRecord: { is: { institutionId: institution.id, synthetic: true } },
+    };
+    try {
+      const [reports, totalReports] = await prisma.$transaction([
+        prisma.discrepancyReport.findMany({
+          where,
+          orderBy: [{ createdAt: "desc" }, { id: "asc" }],
+          skip: (page - 1) * pageSize,
+          take: pageSize,
+          include: {
+            studentRecord: { select: { id: true, reference: true, fullName: true, program: true } },
+            history: { orderBy: { createdAt: "asc" } },
+          },
+        }),
+        prisma.discrepancyReport.count({ where }),
+      ]);
+
+      response.json({
+        reports,
+        pagination: { page, pageSize, totalReports, totalPages: Math.ceil(totalReports / pageSize) },
+        prototype: prototypeAccess,
+      });
+    } catch {
+      response.status(503).json({ error: "discrepancies_unavailable", message: "Discrepancy reports are temporarily unavailable.", prototype: prototypeAccess });
+    }
+  });
+
+  router.patch("/discrepancies/:reportId", async (request, response) => {
+    const parsedId = discrepancyIdSchema.safeParse(request.params.reportId);
+    const parsedBody = reviewerUpdateSchema.safeParse(request.body);
+    if (!parsedId.success || !parsedBody.success) {
+      response.status(400).json({ error: "invalid_review_update", message: "Choose UNDER_REVIEW or RESOLVED and provide a 5–1000 character review note.", prototype: prototypeAccess });
+      return;
+    }
+
+    const institution = scopeOf(request);
+    try {
+      const result = await prisma.$transaction(async (transaction) => {
+        const existing = await transaction.discrepancyReport.findFirst({
+          where: {
+            id: parsedId.data,
+            synthetic: true,
+            studentRecord: { is: { institutionId: institution.id, synthetic: true } },
+          },
+          select: { id: true, status: true },
+        });
+        if (!existing) return { kind: "missing" as const };
+        if (existing.status === DiscrepancyStatus.RESOLVED) return { kind: "resolved" as const };
+
+        const report = await transaction.discrepancyReport.update({
+          where: { id: existing.id },
+          data: {
+            status: parsedBody.data.status,
+            resolutionNote: parsedBody.data.resolutionNote,
+            history: {
+              create: {
+                actor: ReviewActor.INSTITUTION_DEMO,
+                action: ReviewEventAction.REVIEW_UPDATED,
+                fromStatus: existing.status,
+                toStatus: parsedBody.data.status,
+                note: parsedBody.data.resolutionNote,
+              },
+            },
+          },
+          include: {
+            studentRecord: { select: { id: true, reference: true, fullName: true, program: true } },
+            history: { orderBy: { createdAt: "asc" } },
+          },
+        });
+        return { kind: "updated" as const, report };
+      });
+
+      if (result.kind === "missing") {
+        response.status(404).json({ error: "discrepancy_not_found", message: "No discrepancy report exists in this institution scope.", prototype: prototypeAccess });
+        return;
+      }
+      if (result.kind === "resolved") {
+        response.status(409).json({ error: "discrepancy_already_resolved", message: "Resolved reports cannot be changed in this prototype.", prototype: prototypeAccess });
+        return;
+      }
+      response.json({ report: result.report, prototype: prototypeAccess });
+    } catch (error) {
+      console.error("Institution demo discrepancy review failed.", { errorType: error instanceof Error ? error.name : "UnknownError" });
+      response.status(503).json({ error: "review_unavailable", message: "The discrepancy review could not be saved.", prototype: prototypeAccess });
     }
   });
 

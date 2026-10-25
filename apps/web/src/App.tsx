@@ -1,6 +1,8 @@
 import { useEffect, useState, type FormEvent } from "react";
+import StudentReviewPanel from "./components/StudentReviewPanel";
+import InstitutionDiscrepancyPanel from "./components/InstitutionDiscrepancyPanel";
+import { demoInstitutionCode as institutionCode } from "./demo-config";
 
-const institutionCode = "DEMO-AICTE-001";
 const pageSize = 10;
 
 type StudentRecord = {
@@ -51,6 +53,7 @@ async function readApiError(response: Response): Promise<string> {
 }
 
 export default function App() {
+  const [activeWorkspace, setActiveWorkspace] = useState<"institution" | "student" | "review">("institution");
   const [records, setRecords] = useState<StudentRecord[]>([]);
   const [totalRecords, setTotalRecords] = useState(0);
   const [totalPages, setTotalPages] = useState(0);
@@ -123,7 +126,7 @@ export default function App() {
             <span className="grid size-11 place-items-center rounded-2xl bg-indigo-700 text-sm font-bold text-white">AT</span>
             <span>
               <span className="block text-sm font-bold tracking-tight text-slate-950">APAAR Trust</span>
-              <span className="block text-xs text-slate-500">Institution record workspace</span>
+              <span className="block text-xs text-slate-500">Student and institution demo workspace</span>
             </span>
           </a>
           <div className="flex items-center gap-3">
@@ -133,25 +136,35 @@ export default function App() {
         </header>
 
         <section className="py-8 sm:py-10">
-          <p className="text-xs font-bold uppercase tracking-[0.2em] text-indigo-700">Institution dashboard</p>
+          <p className="text-xs font-bold uppercase tracking-[0.2em] text-indigo-700">Cross-verification prototype</p>
           <div className="mt-2 flex flex-wrap items-end justify-between gap-5">
             <div>
-              <h1 className="text-3xl font-semibold tracking-tight text-slate-950 sm:text-4xl">Student records</h1>
-              <p className="mt-2 text-sm text-slate-600">Review the institution’s current records or import a synthetic CSV roster.</p>
+              <h1 className="text-3xl font-semibold tracking-tight text-slate-950 sm:text-4xl">
+                {activeWorkspace === "student" ? "Review your demo record" : activeWorkspace === "review" ? "Review discrepancy reports" : "Student records"}
+              </h1>
+              <p className="mt-2 text-sm text-slate-600">
+                {activeWorkspace === "student" ? "Check synthetic institution-reported details and respond." : activeWorkspace === "review" ? "Review student claims while keeping institution values intact." : "Review the institution’s current records or import a synthetic CSV roster."}
+              </p>
             </div>
-            <div className="min-w-36 rounded-2xl border border-slate-200 bg-white px-4 py-3 shadow-sm">
+            {activeWorkspace === "institution" && <div className="min-w-36 rounded-2xl border border-slate-200 bg-white px-4 py-3 shadow-sm">
               <p className="text-xs font-medium text-slate-500">Records in this institution</p>
               <p className="mt-1 text-2xl font-semibold text-slate-950">{loading ? "…" : totalRecords}</p>
-            </div>
+            </div>}
           </div>
 
           <div role="note" className="mt-6 flex gap-3 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3.5 text-sm leading-6 text-amber-950">
             <span className="mt-0.5 font-bold" aria-hidden="true">!</span>
-            <p><strong>Prototype access only.</strong> The demo institution code scopes API queries, but it is not authentication. Sign-in and production authorization are not implemented; do not use this endpoint for real student data.</p>
+            <p><strong>Prototype access only.</strong> Demo record selection and the institution code are not authentication. Sign-in and production authorization are not implemented; do not use these workflows with real student data.</p>
           </div>
         </section>
 
-        <section className="grid gap-6 lg:grid-cols-[minmax(0,1.35fr)_minmax(320px,0.65fr)] lg:items-start">
+        <nav aria-label="Prototype workspaces" className="mb-6 flex flex-wrap gap-2 rounded-2xl border border-slate-200 bg-white p-2 shadow-sm">
+          <button type="button" aria-current={activeWorkspace === "institution" ? "page" : undefined} onClick={() => setActiveWorkspace("institution")} className={`rounded-xl px-4 py-2.5 text-sm font-semibold ${activeWorkspace === "institution" ? "bg-indigo-700 text-white" : "text-slate-600 hover:bg-slate-100"}`}>Institution roster</button>
+          <button type="button" aria-current={activeWorkspace === "student" ? "page" : undefined} onClick={() => setActiveWorkspace("student")} className={`rounded-xl px-4 py-2.5 text-sm font-semibold ${activeWorkspace === "student" ? "bg-indigo-700 text-white" : "text-slate-600 hover:bg-slate-100"}`}>Student review demo</button>
+          <button type="button" aria-current={activeWorkspace === "review" ? "page" : undefined} onClick={() => setActiveWorkspace("review")} className={`rounded-xl px-4 py-2.5 text-sm font-semibold ${activeWorkspace === "review" ? "bg-indigo-700 text-white" : "text-slate-600 hover:bg-slate-100"}`}>Discrepancy review</button>
+        </nav>
+
+        {activeWorkspace === "institution" && <section className="grid gap-6 lg:grid-cols-[minmax(0,1.35fr)_minmax(320px,0.65fr)] lg:items-start">
           <div className="overflow-hidden rounded-3xl border border-slate-200 bg-white shadow-sm">
             <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-100 px-5 py-4 sm:px-6">
               <div>
@@ -246,7 +259,10 @@ export default function App() {
               </section>
             )}
           </aside>
-        </section>
+        </section>}
+
+        {activeWorkspace === "student" && <StudentReviewPanel />}
+        {activeWorkspace === "review" && <InstitutionDiscrepancyPanel />}
 
         <footer className="mt-8 border-t border-slate-200 py-5 text-xs text-slate-500">
           Student confirmation is not official APAAR verification. No government integrations are connected.

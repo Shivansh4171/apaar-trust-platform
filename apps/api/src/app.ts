@@ -3,6 +3,7 @@ import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "./generated/prisma/client.js";
 import { apiEnvironment } from "./config.js";
 import { createInstitutionRouter, csvUploadErrorHandler } from "./routes/institution.js";
+import { createStudentRouter } from "./routes/student.js";
 
 const adapter = new PrismaPg({ connectionString: apiEnvironment.DATABASE_URL });
 const prisma = new PrismaClient({ adapter });
@@ -31,6 +32,7 @@ export function createApp() {
   });
 
   app.use("/api/institution", createInstitutionRouter(prisma));
+  app.use("/api/student", createStudentRouter(prisma));
   app.use(csvUploadErrorHandler);
   app.use(((error, _request, response, _next) => {
     console.error("Unhandled API request error.", {
