@@ -1,5 +1,13 @@
 import { parse as parseCsv } from "csv-parse/sync";
-import { z } from "zod";
+import {
+  evaluateSubmissionMatches,
+  invalidCsvRowStructureFinding,
+  missingCsvColumnFinding,
+  validateStudentValues,
+  type QualityFinding,
+} from "./data-quality.js";
+
+export { studentRecordValuesSchema } from "./data-quality.js";
 
 export const MAX_CSV_ROWS = 500;
 
@@ -11,6 +19,7 @@ export interface StudentCsvRow {
 }
 
 export interface ExistingStudentRecord {
+  id?: string;
   reference: string;
   fullName: string;
   program: string;
@@ -27,6 +36,7 @@ export interface CsvImportRepository {
 
 export interface CsvImportReport {
   totalRows: number;
+  findings: QualityFinding[];
   acceptedRows: Array<{ rowNumber: number; reference: string }>;
   rejectedRows: Array<{ rowNumber: number; reference: string | null; reasons: string[] }>;
   flaggedForReviewRows: Array<{
@@ -41,27 +51,6 @@ interface ParsedCsvRecord {
   record: string[];
   info: { lines: number };
 }
-
-const csvStudentSchema = z.object({
-  reference: z
-    .string()
-    .trim()
-    .min(2, "Reference must contain at least 2 characters.")
-    .max(40, "Reference must contain at most 40 characters.")
-    .regex(/^SYNTH-[A-Za-z0-9][A-Za-z0-9_-]*$/i, "Synthetic references must start with SYNTH- and contain only letters, numbers, hyphens, or underscores."),
-  fullName: z
-    .string()
-    .trim()
-    .min(2, "Full name must contain at least 2 characters.")
-    .max(120, "Full name must contain at most 120 characters.")
-    .regex(/^[\p{L}][\p{L}\p{M} .'-]*$/u, "Full name contains unsupported characters."),
-  program: z
-    .string()
-    .trim()
-    .min(2, "Program must contain at least 2 characters.")
-    .max(120, "Program must contain at most 120 characters.")
-    .regex(/^[\p{L}\p{N}][\p{L}\p{M}\p{N} .&'+()/,-]*$/u, "Program contains unsupported characters."),
-});
 
 export class CsvImportInputError extends Error {
   constructor(
@@ -82,27 +71,13 @@ export class CsvImportDatabaseError extends Error {
 }
 
 function emptyReport(totalRows = 0): CsvImportReport {
-  return { totalRows, acceptedRows: [], rejectedRows: [], flaggedForReviewRows: [] };
+  return { totalRows, findings: [], acceptedRows: [], rejectedRows: [], flaggedForReviewRows: [] };
 }
 
 function inputError(message: string, reason: string, statusCode = 400, rowNumber = 1, totalRows = 0): CsvImportInputError {
   const report = emptyReport(totalRows);
   report.rejectedRows.push({ rowNumber, reference: null, reasons: [reason] });
   return new CsvImportInputError(message, statusCode, report);
-}
-
-function normalize(value: string): string {
-  return value.normalize("NFKC").trim().toLocaleLowerCase("en");
-}
-
-function duplicateReason(existing: ExistingStudentRecord, incoming: StudentCsvRow): string | null {
-  if (normalize(existing.reference) === normalize(incoming.reference)) {
-    return `Possible duplicate of existing reference ${existing.reference}; flagged for review and not imported.`;
-  }
-  if (normalize(existing.fullName) === normalize(incoming.fullName) && normalize(existing.program) === normalize(incoming.program)) {
-    return `Possible duplicate of ${existing.fullName} in ${existing.program}; flagged for review and not imported.`;
-  }
-  return null;
 }
 
 export async function importStudentCsv(
@@ -147,6 +122,12 @@ export async function importStudentCsv(
   if (headerIssues.length > 0) {
     const report = emptyReport(records.length - 1);
     report.rejectedRows.push({ rowNumber: 1, reference: null, reasons: headerIssues });
+    for (const required of requiredHeaders) {
+      if (!header.includes(required)) report.findings.push(missingCsvColumnFinding(required));
+    }
+    if (report.findings.length === 0) {
+      report.findings.push(invalidCsvRowStructureFinding(1, null, requiredHeaders.length, header.length));
+    }
     throw new CsvImportInputError("The CSV headers are invalid.", 400, report);
   }
 
@@ -172,63 +153,68 @@ export async function importStudentCsv(
         reference: record[columnIndex.get("reference") ?? 0]?.trim() || null,
         reasons: [`Expected ${header.length} fields but found ${record.length}.`],
       });
+      report.findings.push(invalidCsvRowStructureFinding(
+        info.lines,
+        record[columnIndex.get("reference") ?? 0]?.trim() || null,
+        header.length,
+        record.length,
+      ));
       continue;
     }
 
-    const result = csvStudentSchema.safeParse({
+    const rawValues = {
       reference: record[columnIndex.get("reference") ?? 0],
       fullName: record[columnIndex.get("fullName") ?? 1],
       program: record[columnIndex.get("program") ?? 2],
-    });
+    };
+    const location = {
+      institutionId,
+      rowNumber: info.lines,
+      reference: typeof rawValues.reference === "string" ? rawValues.reference.trim() : "",
+    };
+    const result = validateStudentValues(rawValues, location);
 
-    if (!result.success) {
+    if (!result.parsed) {
       report.rejectedRows.push({
         rowNumber: info.lines,
         reference: record[columnIndex.get("reference") ?? 0]?.trim() || null,
-        reasons: result.error.issues.map((issue) => issue.message),
+        reasons: result.validationMessages,
       });
+      report.findings.push(...result.findings);
       continue;
     }
 
-    validRows.push({ ...result.data, rowNumber: info.lines });
+    validRows.push({ ...result.parsed, rowNumber: info.lines });
   }
 
   if (validRows.length === 0) return report;
 
-  const internalReasons = new Map<number, Set<string>>();
-  for (let left = 0; left < validRows.length; left += 1) {
-    for (let right = left + 1; right < validRows.length; right += 1) {
-      const first = validRows[left];
-      const second = validRows[right];
-      const sameReference = normalize(first.reference) === normalize(second.reference);
-      const sameStudentAndProgram = normalize(first.fullName) === normalize(second.fullName)
-        && normalize(first.program) === normalize(second.program);
-      if (!sameReference && !sameStudentAndProgram) continue;
-
-      const reason = `Possible duplicate within this upload (rows ${first.rowNumber} and ${second.rowNumber}); both rows are flagged for review and not imported.`;
-      for (const row of [first, second]) {
-        const reasons = internalReasons.get(row.rowNumber) ?? new Set<string>();
-        reasons.add(reason);
-        internalReasons.set(row.rowNumber, reasons);
-      }
-    }
-  }
-
   try {
     await repository.withTransaction(institutionId, async (transaction) => {
       const existingRecords = await transaction.findPotentialDuplicates(validRows);
+      const incomingCandidates = validRows.map((row) => ({ institutionId, ...row }));
+      const existingCandidates = existingRecords.map((record) => ({
+        institutionId,
+        recordId: record.id,
+        reference: record.reference,
+        fullName: record.fullName,
+        program: record.program,
+      }));
+      const duplicateFindings = evaluateSubmissionMatches(incomingCandidates, existingCandidates);
+      report.findings.push(...duplicateFindings);
+      const findingsByRow = new Map<number, QualityFinding[]>();
+      for (const finding of duplicateFindings) {
+        if (finding.affected.rowNumber === undefined) continue;
+        const rowFindings = findingsByRow.get(finding.affected.rowNumber) ?? [];
+        rowFindings.push(finding);
+        findingsByRow.set(finding.affected.rowNumber, rowFindings);
+      }
       const acceptedRows: StudentCsvRow[] = [];
 
       for (const row of validRows) {
-        const reasons = [...(internalReasons.get(row.rowNumber) ?? [])];
-        const possibleMatches = new Set<string>();
-        for (const existing of existingRecords) {
-          const reason = duplicateReason(existing, row);
-          if (reason) {
-            reasons.push(reason);
-            possibleMatches.add(existing.reference);
-          }
-        }
+        const rowFindings = findingsByRow.get(row.rowNumber) ?? [];
+        const reasons = rowFindings.map((finding) => finding.explanation);
+        const possibleMatches = new Set(rowFindings.flatMap((finding) => finding.matched?.reference ? [finding.matched.reference] : []));
 
         if (reasons.length > 0) {
           report.flaggedForReviewRows.push({
@@ -247,6 +233,7 @@ export async function importStudentCsv(
     });
   } catch (cause) {
     const failedReport = emptyReport(dataRecords.length);
+    failedReport.findings = [...report.findings];
     failedReport.rejectedRows = [...report.rejectedRows];
     failedReport.rejectedRows.push(...validRows.map((row) => ({
       rowNumber: row.rowNumber,

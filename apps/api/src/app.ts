@@ -6,6 +6,7 @@ import { requireSameOrigin, sessionMiddleware } from "./auth.js";
 import { createAuthRouter } from "./routes/auth.js";
 import { createInstitutionRouter, csvUploadErrorHandler } from "./routes/institution.js";
 import { createStudentRouter } from "./routes/student.js";
+import { createAicteRouter } from "./routes/aicte.js";
 
 const adapter = new PrismaPg({ connectionString: apiEnvironment.DATABASE_URL });
 const prisma = new PrismaClient({ adapter });
@@ -43,6 +44,7 @@ export function createApp() {
   });
 
   app.use("/api/auth", createAuthRouter(prisma));
+  app.use("/api/aicte", createAicteRouter(prisma));
   app.use("/api/institution", createInstitutionRouter(prisma));
   app.use("/api/student", createStudentRouter(prisma));
   app.use(csvUploadErrorHandler);

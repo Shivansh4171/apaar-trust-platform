@@ -12,6 +12,7 @@ import {
   type StudentCsvRow,
 } from "../services/csv-import.js";
 import { reviewerUpdateSchema } from "../services/student-review.js";
+import { correctionSnapshot, studentRecordCorrectionInputSchema } from "../services/student-correction.js";
 
 const paginationSchema = z.object({
   page: z.coerce.number().int().min(1).default(1),
@@ -20,6 +21,8 @@ const paginationSchema = z.object({
 
 const discrepancyListSchema = paginationSchema.extend({
   status: z.nativeEnum(DiscrepancyStatus).optional(),
+  institutionId: z.string().trim().min(10).max(32).optional(),
+  program: z.string().trim().min(1).max(120).optional(),
 });
 const discrepancyIdSchema = z.string().min(10).max(32);
 
@@ -50,16 +53,13 @@ function createCsvImportRepository(prisma: PrismaClient): CsvImportRepository {
       prisma.$transaction(async (transaction) => operation({
         findPotentialDuplicates: async (rows: StudentCsvRow[]) => {
           const references = [...new Set(rows.map((row) => row.reference))];
-          const names = [...new Set(rows.map((row) => row.fullName))];
           return transaction.studentRecord.findMany({
             where: {
               institutionId,
-              OR: [
-                { reference: { in: references, mode: "insensitive" } },
-                { fullName: { in: names, mode: "insensitive" } },
-              ],
+              reference: { in: references, mode: "insensitive" },
             },
-            select: { reference: true, fullName: true, program: true },
+            orderBy: [{ reference: "asc" }, { id: "asc" }],
+            select: { id: true, reference: true, fullName: true, program: true },
           });
         },
         insert: async (rows: StudentCsvRow[]) => {
@@ -133,6 +133,132 @@ export function createInstitutionRouter(prisma: PrismaClient): Router {
     }
   });
 
+  router.get("/records/:recordId/corrections", requireRoles("AICTE_ADMIN", "REVIEWER", "INSTITUTION_ADMIN", "INSTITUTION_OPERATOR"), async (request, response) => {
+    const parsedId = discrepancyIdSchema.safeParse(request.params.recordId);
+    if (!parsedId.success) {
+      response.status(400).json({ error: "invalid_record_id", message: "Choose a valid student record." });
+      return;
+    }
+
+    const user = authenticatedUser(request);
+    const scope = institutionFilter(user);
+    try {
+      const result = await prisma.$transaction(async (transaction) => {
+        const record = await transaction.studentRecord.findFirst({
+          where: { id: parsedId.data, synthetic: true, ...scope },
+          select: { id: true, reference: true },
+        });
+        if (!record) return null;
+        const corrections = await transaction.studentRecordCorrection.findMany({
+          where: { studentRecordId: record.id },
+          orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+          select: {
+            id: true,
+            studentRecordId: true,
+            previousValues: true,
+            newValues: true,
+            reason: true,
+            actorEmail: true,
+            actorRole: true,
+            createdAt: true,
+          },
+        });
+        return { record, corrections };
+      });
+
+      if (!result) {
+        response.status(404).json({ error: "record_not_found", message: "No student record exists in this institution scope." });
+        return;
+      }
+      response.json(result);
+    } catch (error) {
+      console.error("Student record correction history failed.", { errorType: error instanceof Error ? error.name : "UnknownError" });
+      response.status(503).json({ error: "correction_history_unavailable", message: "Correction history is temporarily unavailable." });
+    }
+  });
+
+  router.patch("/records/:recordId/corrections", requireRoles("INSTITUTION_ADMIN"), async (request, response) => {
+    const parsedId = discrepancyIdSchema.safeParse(request.params.recordId);
+    const parsedBody = studentRecordCorrectionInputSchema.safeParse(request.body);
+    if (!parsedId.success || !parsedBody.success) {
+      response.status(400).json({ error: "invalid_correction", message: "Choose one or more valid record fields and provide a correction reason of 10–1000 characters." });
+      return;
+    }
+
+    const user = authenticatedUser(request);
+    const scope = institutionFilter(user);
+    try {
+      const result = await prisma.$transaction(async (transaction) => {
+        const existing = await transaction.studentRecord.findFirst({
+          where: { id: parsedId.data, synthetic: true, ...scope },
+          select: { id: true, reference: true, fullName: true, program: true, status: true },
+        });
+        if (!existing) return { kind: "missing" as const };
+
+        const snapshot = correctionSnapshot(existing, parsedBody.data);
+        if (Object.keys(snapshot.update).length === 0) return { kind: "unchanged" as const };
+
+        const updated = await transaction.studentRecord.update({
+          where: { id: existing.id },
+          data: {
+            ...snapshot.update,
+            corrections: {
+              create: {
+                previousValues: snapshot.previousValues,
+                newValues: snapshot.newValues,
+                reason: parsedBody.data.reason,
+                actorEmail: user.email,
+                actorRole: user.role,
+                actorUserId: user.id,
+              },
+            },
+          },
+          select: {
+            id: true,
+            reference: true,
+            fullName: true,
+            program: true,
+            status: true,
+            updatedAt: true,
+            corrections: {
+              orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+              take: 1,
+              select: {
+                id: true,
+                studentRecordId: true,
+                previousValues: true,
+                newValues: true,
+                reason: true,
+                actorEmail: true,
+                actorRole: true,
+                createdAt: true,
+              },
+            },
+          },
+        });
+        return { kind: "updated" as const, record: updated };
+      }, { isolationLevel: "Serializable" });
+
+      if (result.kind === "missing") {
+        response.status(404).json({ error: "record_not_found", message: "No student record exists in this institution scope." });
+        return;
+      }
+      if (result.kind === "unchanged") {
+        response.status(400).json({ error: "correction_unchanged", message: "At least one submitted field must differ from the current institution record." });
+        return;
+      }
+      const { corrections, ...record } = result.record;
+      response.json({ record, correction: corrections[0] });
+    } catch (error) {
+      if (typeof error === "object" && error !== null && "code" in error && error.code === "P2002") {
+        response.status(409).json({ error: "duplicate_reference", message: "A record with this reference already exists in your institution." });
+        return;
+      }
+      console.error("Student record correction failed.", { errorType: error instanceof Error ? error.name : "UnknownError" });
+      response.status(503).json({ error: "correction_unavailable", message: "The student record correction could not be saved." });
+    }
+  });
+
   router.get("/discrepancies", requireRoles("AICTE_ADMIN", "REVIEWER", "INSTITUTION_ADMIN", "INSTITUTION_OPERATOR"), async (request, response) => {
     const parsedQuery = discrepancyListSchema.safeParse(request.query);
     if (!parsedQuery.success) {
@@ -140,31 +266,52 @@ export function createInstitutionRouter(prisma: PrismaClient): Router {
       return;
     }
 
-    const scope = institutionFilter(authenticatedUser(request));
-    const { page, pageSize, status } = parsedQuery.data;
+    const user = authenticatedUser(request);
+    const scope = institutionFilter(user);
+    const { page, pageSize, status, institutionId, program } = parsedQuery.data;
+    if (scope.institutionId && institutionId && institutionId !== scope.institutionId) {
+      response.status(404).json({ error: "institution_not_found", message: "No discrepancy reports match this institution scope." });
+      return;
+    }
+    const selectedInstitutionId = scope.institutionId ?? institutionId;
     const where = {
       synthetic: true,
       ...(status ? { status } : {}),
-      studentRecord: { is: { ...scope, synthetic: true } },
+      studentRecord: { is: { ...scope, ...(selectedInstitutionId ? { institutionId: selectedInstitutionId } : {}), ...(program ? { program } : {}), synthetic: true } },
     };
     try {
-      const [reports, totalReports] = await prisma.$transaction([
+      const [reports, totalReports, institutions, programs] = await prisma.$transaction([
         prisma.discrepancyReport.findMany({
           where,
           orderBy: [{ createdAt: "desc" }, { id: "asc" }],
           skip: (page - 1) * pageSize,
           take: pageSize,
           include: {
-            studentRecord: { select: { id: true, reference: true, fullName: true, program: true } },
-            history: { orderBy: { createdAt: "asc" } },
+            studentRecord: { select: { id: true, reference: true, fullName: true, program: true, institution: { select: { id: true, code: true, name: true } } } },
+            history: { orderBy: { createdAt: "asc" }, include: { actorUser: { select: { email: true } } } },
           },
         }),
         prisma.discrepancyReport.count({ where }),
+        prisma.institution.findMany({
+          where: selectedInstitutionId
+            ? { id: selectedInstitutionId, students: { some: { synthetic: true } } }
+            : { students: { some: { synthetic: true } } },
+          orderBy: [{ name: "asc" }, { code: "asc" }],
+          select: { id: true, name: true, code: true },
+        }),
+        prisma.studentRecord.findMany({
+          where: { synthetic: true, ...(selectedInstitutionId ? { institutionId: selectedInstitutionId } : {}) },
+          distinct: ["program"],
+          orderBy: { program: "asc" },
+          select: { program: true },
+        }),
       ]);
 
       response.json({
         reports,
         pagination: { page, pageSize, totalReports, totalPages: Math.ceil(totalReports / pageSize) },
+        options: { institutions, programs: programs.map((entry) => entry.program) },
+        filters: { status: status ?? "ALL", institutionId: selectedInstitutionId ?? "ALL", program: program ?? "ALL" },
       });
     } catch {
       response.status(503).json({ error: "discrepancies_unavailable", message: "Discrepancy reports are temporarily unavailable." });
@@ -211,8 +358,8 @@ export function createInstitutionRouter(prisma: PrismaClient): Router {
             },
           },
           include: {
-            studentRecord: { select: { id: true, reference: true, fullName: true, program: true } },
-            history: { orderBy: { createdAt: "asc" } },
+            studentRecord: { select: { id: true, reference: true, fullName: true, program: true, institution: { select: { id: true, code: true, name: true } } } },
+            history: { orderBy: { createdAt: "asc" }, include: { actorUser: { select: { email: true } } } },
           },
         });
         return { kind: "updated" as const, report };

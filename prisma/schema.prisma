@@ -73,6 +73,7 @@ model StudentRecord {
   institution   Institution  @relation(fields: [institutionId], references: [id], onDelete: Restrict)
   confirmations StudentConfirmation[]
   discrepancies DiscrepancyReport[]
+  corrections   StudentRecordCorrection[]
   studentUser   User?         @relation("StudentAccount")
 
   @@unique([institutionId, reference])
@@ -124,8 +125,25 @@ model User {
   studentRecord   StudentRecord? @relation("StudentAccount", fields: [studentRecordId], references: [id], onDelete: Restrict)
   confirmations   StudentConfirmation[]
   reviewEvents    DiscrepancyReportEvent[]
+  correctionEvents StudentRecordCorrection[]
 
   @@index([institutionId, role])
+}
+
+model StudentRecordCorrection {
+  id              String        @id @default(cuid())
+  studentRecordId String
+  previousValues  Json
+  newValues       Json
+  reason          String        @db.VarChar(1000)
+  actorEmail      String        @db.VarChar(254)
+  actorRole       UserRole
+  actorUserId     String?
+  createdAt       DateTime      @default(now())
+  studentRecord   StudentRecord @relation(fields: [studentRecordId], references: [id], onDelete: Restrict)
+  actorUser       User?         @relation(fields: [actorUserId], references: [id], onDelete: SetNull)
+
+  @@index([studentRecordId, createdAt])
 }
 
 model AuthSession {

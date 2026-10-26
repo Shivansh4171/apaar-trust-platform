@@ -141,6 +141,20 @@ export function createStudentRouter(prisma: PrismaClient): Router {
           return { kind: "unchanged" as const };
         }
 
+        const duplicate = await transaction.discrepancyReport.findFirst({
+          where: {
+            studentRecordId: record.id,
+            field: parsedBody.data.field,
+            institutionValue,
+            claimedValue: claimedValueCheck.data,
+            reason: parsedBody.data.reason,
+            status: { in: [DiscrepancyStatus.OPEN, DiscrepancyStatus.UNDER_REVIEW] },
+            synthetic: true,
+          },
+          select: { id: true },
+        });
+        if (duplicate) return { kind: "duplicate" as const };
+
         const report = await transaction.discrepancyReport.create({
           data: {
             studentRecordId: record.id,
@@ -171,7 +185,7 @@ export function createStudentRouter(prisma: PrismaClient): Router {
           },
         });
         return { kind: "created" as const, report, reference: record.reference };
-      });
+      }, { isolationLevel: "Serializable" });
 
       if (result.kind === "missing") {
         response.status(404).json({ error: "demo_record_not_found", message: "The selected synthetic record was not found.", prototype: prototypeStatus });
@@ -179,6 +193,10 @@ export function createStudentRouter(prisma: PrismaClient): Router {
       }
       if (result.kind === "unchanged") {
         response.status(400).json({ error: "no_discrepancy", message: "The claimed value must differ from the institution-reported value.", prototype: prototypeStatus });
+        return;
+      }
+      if (result.kind === "duplicate") {
+        response.status(409).json({ error: "duplicate_discrepancy", message: "An open or in-review discrepancy with the same claim and reason already exists.", prototype: prototypeStatus });
         return;
       }
 

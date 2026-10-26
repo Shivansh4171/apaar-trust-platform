@@ -7,4 +7,24 @@ test-results/
 .env
 .env.*
 !.env.example
+.aws
 .DS_Store
+
+# Local database files and backups
+*.db
+*.sqlite
+*.sqlite3
+*.dump
+*.backup
+*.sql.gz
+postgres_data/
+db-data/
+local-db/
+
+# Logs and local test/browser artifacts
+*.log
+logs/
+screenshots/
+artifacts/
+*.har
+*.trace.zip
